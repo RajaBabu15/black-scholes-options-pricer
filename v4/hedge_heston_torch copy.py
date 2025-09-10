@@ -308,7 +308,7 @@ def implied_vol_from_price(price, S, K, r, q, T, option_type='call', tol=1e-8, m
     return 0.5 * (lo + hi)
 
 # --- Hedging simulator using PyTorch ---
-def delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=0.0008, impact_lambda=0.0, option_type='call', rebal_freq=1, deltas_mode='bs', per_path_deltas=None, exposure_scale=1.0):
+def delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=0.0008, impact_lambda=0.0, option_type='call', rebal_freq=1, deltas_mode='bs', per_path_deltas=None):
     # Convert to torch tensors
     S_paths = torch.as_tensor(S_paths, dtype=tensor_dtype, device=device)
     v_paths = torch.as_tensor(v_paths, dtype=tensor_dtype, device=device)
@@ -339,9 +339,6 @@ def delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=0.0008, impact_lambda=0
             deltas = torch.as_tensor(per_path_deltas[i], dtype=tensor_dtype, device=device)
         else:
             raise ValueError("Unknown deltas_mode")
-        
-        # Apply exposure scaling (volatility targeting / risk control)
-        deltas = deltas * torch.tensor(exposure_scale, dtype=tensor_dtype, device=device)
         
         Delta_prev = deltas[0]
         cash = C0 - Delta_prev * S_path[0] - (torch.abs(Delta_prev*S_path[0]) * tc + impact_lambda*(Delta_prev*S_path[0])**2)
@@ -381,7 +378,7 @@ def delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=0.0008, impact_lambda=0
     return pnl.cpu().numpy(), C0.cpu().item() if isinstance(C0, torch.Tensor) else C0
 
 # --- Per-path deltas via scaling using PyTorch ---
-def compute_per_path_deltas_scaling(S_paths, K, times, r, q, relative_eps=0.001):
+def compute_per_path_deltas_scaling(S_paths, K, times, r, relative_eps=0.001):
     """Compute deltas using relative finite differences with proper discounting."""
     S_paths = torch.as_tensor(S_paths, dtype=tensor_dtype, device=device)
     times = torch.as_tensor(times, dtype=tensor_dtype, device=device)
@@ -1369,7 +1366,7 @@ if __name__ == "__main__":
         print(f"  Calibration error: {e}, using default parameters")
     # Use relative epsilon based on current stock price
     relative_eps = 0.001 * S0  # 0.1% of current price
-    per_path_deltas = compute_per_path_deltas_scaling(S_paths, K, times, r, q, relative_eps=0.001)
+    per_path_deltas = compute_per_path_deltas_scaling(S_paths, K, times, r, relative_eps=0.001)
     
     print("\\nEstimating vega from real market options...")
     valid_ivs = target_ivs[target_ivs > 0]
