@@ -29,32 +29,16 @@ def main(ticker: str | None = None, tickers: List[str] | None = None, limit: int
     else:
         resolved = [t.strip().upper() for t in tickers if t and t.strip()]
 
-    # Try to load local CSVs; keep only those that succeed
-    valid_tickers: List[str] = []
-    for tk in resolved:
-        csv_path = os.path.join(DATA_DIR, f"{tk}.csv")
-        try:
-            if os.path.exists(csv_path):
-                # Try loading to validate
-                _df = pd.read_csv(csv_path)
-                valid_tickers.append(tk)
-            else:
-                print(f"[WARN] Missing local data file: {csv_path} — skipping {tk}")
-        except Exception as e:
-            print(f"[WARN] Failed to load {csv_path}: {e} — skipping {tk}")
-
+    # Ensure data exists: load or download tickers; use AAPL fallback if needed
+    from optlib.data.history import load_or_download_many
+    data_map = load_or_download_many(resolved, years=2, data_dir=DATA_DIR)
+    valid_tickers = list(data_map.keys())
     if not valid_tickers:
-        fallback_csv = os.path.join(DATA_DIR, 'AAPL.csv')
-        if os.path.exists(fallback_csv):
-            valid_tickers = ['AAPL']
-            print("[INFO] Falling back to AAPL only.")
-        else:
-            print("[ERROR] No local CSVs found in data/. Aborting.")
-            return []
-
+        print("[ERROR] No data available even after download attempts.")
+        return []
     # Enforce limit and run portfolio
     valid_tickers = valid_tickers[:max(1, int(limit))]
-    return run(tickers=valid_tickers, limit=len(valid_tickers), data_dir=DATA_DIR, log_dir=LOG_DIR)
+    return run_many(tickers=valid_tickers, limit=len(valid_tickers), data_dir=DATA_DIR, log_dir=LOG_DIR)
 
 if __name__ == '__main__':
     main(tickers=default_100_tickers())
