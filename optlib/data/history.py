@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime
 
 def load_or_download_hist(ticker: str, years: int, data_dir: str) -> pd.DataFrame:
-    path = os.path.join(data_dir, f"{ticker}_hist.csv")
+    path = os.path.join(data_dir, f"{ticker}.csv")
     if os.path.exists(path):
         df = pd.read_csv(path, parse_dates=['Date']).set_index('Date')
         return df

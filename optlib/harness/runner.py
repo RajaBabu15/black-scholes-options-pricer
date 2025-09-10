@@ -180,7 +180,7 @@ def run_hedging_optimization(ticker: str, data_dir: str, log_dir: str) -> Dict:
     return best
 
 
-def run_many(tickers: List[str], limit: int, data_dir: str, log_dir: str):
+def run(tickers: List[str], limit: int, data_dir: str, log_dir: str):
     results = []
     for i, tk in enumerate(tickers[:limit], 1):
         log_message(f"\n=== Running ticker {i}/{min(limit, len(tickers))}: {tk} ===", tk, log_dir)

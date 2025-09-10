@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 
 # High-level harness API
-from optlib.harness.runner import run_hedging_optimization, run_many
+from optlib.harness.runner import run_hedging_optimization, run
 from optlib.data.tickers import default_100_tickers
 from optlib.data.history import load_or_download_hist
 
@@ -19,7 +19,7 @@ def main(ticker: str | None = None, tickers: List[str] | None = None, limit: int
     """Local-data-first unified entrypoint.
     - If `tickers` list is None or empty, default to ['AAPL'].
     - Else use the provided list.
-    - For each ticker, try to load its CSV from DATA_DIR (<TICKER>_hist.csv).
+    - For each ticker, try to load its CSV from DATA_DIR (<TICKER>.csv).
       Only include tickers whose CSV loads successfully.
     - Run the portfolio across the filtered tickers.
     """
@@ -32,7 +32,7 @@ def main(ticker: str | None = None, tickers: List[str] | None = None, limit: int
     # Try to load local CSVs; keep only those that succeed
     valid_tickers: List[str] = []
     for tk in resolved:
-        csv_path = os.path.join(DATA_DIR, f"{tk}_hist.csv")
+        csv_path = os.path.join(DATA_DIR, f"{tk}.csv")
         try:
             if os.path.exists(csv_path):
                 # Try loading to validate
@@ -44,8 +44,7 @@ def main(ticker: str | None = None, tickers: List[str] | None = None, limit: int
             print(f"[WARN] Failed to load {csv_path}: {e} — skipping {tk}")
 
     if not valid_tickers:
-        # Nothing local available; fall back to AAPL if present
-        fallback_csv = os.path.join(DATA_DIR, 'AAPL_hist.csv')
+        fallback_csv = os.path.join(DATA_DIR, 'AAPL.csv')
         if os.path.exists(fallback_csv):
             valid_tickers = ['AAPL']
             print("[INFO] Falling back to AAPL only.")
@@ -55,8 +54,8 @@ def main(ticker: str | None = None, tickers: List[str] | None = None, limit: int
 
     # Enforce limit and run portfolio
     valid_tickers = valid_tickers[:max(1, int(limit))]
-    return run_many(tickers=valid_tickers, limit=len(valid_tickers), data_dir=DATA_DIR, log_dir=LOG_DIR)
+    return run(tickers=valid_tickers, limit=len(valid_tickers), data_dir=DATA_DIR, log_dir=LOG_DIR)
 
 if __name__ == '__main__':
-    main()
+    main(tickers=default_100_tickers())
 
