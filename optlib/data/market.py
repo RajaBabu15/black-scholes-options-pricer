@@ -1,8 +1,8 @@
+import yfinance as yf
 # Market data functions (rates, dividends)
 
 def fetch_risk_free_rate(fallback_rate: float = 0.04) -> float:
     try:
-        import yfinance as yf
         treasury = yf.Ticker("^TNX")
         hist = treasury.history(period="5d")
         if not hist.empty:
@@ -18,7 +18,6 @@ def fetch_risk_free_rate(fallback_rate: float = 0.04) -> float:
 
 def fetch_dividend_yield(ticker: str, fallback_yield: float = 0.0) -> float:
     try:
-        import yfinance as yf
         stock = yf.Ticker(ticker)
         info = stock.info
         yield_fields = ['dividendYield', 'trailingAnnualDividendYield', 'forwardAnnualDividendYield']

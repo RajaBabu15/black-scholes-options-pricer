@@ -23,7 +23,7 @@ def compound_equity_from_returns(returns: torch.Tensor, init: float = 1.0) -> to
 
 
 def max_drawdown_torch(equity: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    peak = torch.maximum.accumulate(equity)
+    peak = torch.cummax(equity, dim=0).values
     dd = (peak - equity) / (peak + eps)
     return dd.max()
 

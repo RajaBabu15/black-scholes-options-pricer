@@ -6,10 +6,12 @@ import pandas as pd
 import torch
 from datetime import datetime
 from typing import List, Dict, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 
 from optlib.data.market import fetch_risk_free_rate, fetch_dividend_yield
 from optlib.data.options import choose_expiries, load_or_download_chain_clean
-from optlib.data.history import load_or_download_hist
+# Removed redundant import - data is now passed in
 from optlib.calibration.heston import calibrate_heston_multi
 from optlib.sim.paths import generate_heston_paths
 from optlib.utils.tensor import tensor_dtype
@@ -21,7 +23,8 @@ from optlib.metrics.performance import calculate_performance_metrics
 def log_message(msg: str, ticker: str, log_dir: str):
     ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     line = f"[{ts}] {msg}"
-    print(line, flush=True)
+    console_line = f"[{ts}] [{ticker}] {msg}"
+    print(console_line, flush=True)
     try:
         os.makedirs(log_dir, exist_ok=True)
         with open(os.path.join(log_dir, f"{ticker}.log"), 'a') as f:
@@ -30,20 +33,19 @@ def log_message(msg: str, ticker: str, log_dir: str):
         pass
 
 
-def run_hedging_optimization(ticker: str, data_dir: str, log_dir: str) -> Dict:
+def run_hedging_optimization(ticker: str, hist_data: pd.DataFrame, stock_ticker: object, data_dir: str, log_dir: str, risk_free_rate: float = None) -> Dict:
     log = lambda m: log_message(m, ticker, log_dir)
     log(f"=== Optimization Harness for {ticker} ===")
 
     # Market params and S0
-    r = fetch_risk_free_rate(fallback_rate=0.041)
+    r = risk_free_rate if risk_free_rate is not None else fetch_risk_free_rate(fallback_rate=0.041)
     q = fetch_dividend_yield(ticker, fallback_yield=0.004)
-    hist = load_or_download_hist(ticker, years=2, data_dir=data_dir)
+    hist = hist_data
     S0 = float(hist['Close'].iloc[-1])
     log(f"S0={S0:.2f}, r={r:.3f}, q={q:.4f}")
 
-    # Option universe
-    import yfinance as yf
-    stock = yf.Ticker(ticker)
+    # Option universe - use pre-created ticker object
+    stock = stock_ticker
     exps = choose_expiries(stock)
     if len(exps) == 0:
         log("No suitable expiries found.")
@@ -180,20 +182,81 @@ def run_hedging_optimization(ticker: str, data_dir: str, log_dir: str) -> Dict:
     return best
 
 
-def run(tickers: List[str], limit: int, data_dir: str, log_dir: str):
-    results = []
-    for i, tk in enumerate(tickers[:limit], 1):
-        log_message(f"\n=== Running ticker {i}/{min(limit, len(tickers))}: {tk} ===", tk, log_dir)
-        try:
-            res = run_hedging_optimization(tk, data_dir=data_dir, log_dir=log_dir)
-            results.append(res)
-        except Exception as e:
-            log_message(f"Error on {tk}: {e}", tk, log_dir)
-    rows = [r for r in results if r is not None]
-    if rows:
-        dfp = pd.DataFrame(rows)
+def run_single_ticker(args):
+    """Wrapper function for parallel processing"""
+    ticker, hist_data_dict, ticker_object_dict, data_dir, log_dir, risk_free_rate = args
+    # Convert dict back to DataFrame (needed for multiprocessing)
+    hist_data = pd.DataFrame(hist_data_dict['data'], index=pd.to_datetime(hist_data_dict['index']))
+    hist_data.index.name = 'Date'
+    # Recreate the ticker object from the serialized data
+    import yfinance as yf
+    stock_ticker = yf.Ticker(ticker)
+    return run_hedging_optimization(ticker, hist_data, stock_ticker, data_dir, log_dir, risk_free_rate)
+
+
+def run(data_map: Dict[str, pd.DataFrame], ticker_objects: Dict[str, object], limit: int, data_dir: str, log_dir: str, parallel: bool = True, max_workers: int = None):
+    tickers = list(data_map.keys())[:limit]
+    print(f"Processing {len(tickers)} tickers: {tickers[:5]}{'...' if len(tickers) > 5 else ''}")
+    
+    # Fetch risk-free rate once for all tickers
+    print("Fetching risk-free rate...")
+    risk_free_rate = fetch_risk_free_rate(fallback_rate=0.041)
+    print(f"Using risk-free rate: {risk_free_rate:.3f} ({risk_free_rate*100:.1f}%)")
+    
+    if parallel and len(tickers) > 1:
+        # Prepare data for multiprocessing (convert DataFrames to serializable format)
+        args_list = []
+        for tk in tickers:
+            hist_data_dict = {
+                'data': data_map[tk].to_dict('records'),
+                'index': [str(d) for d in data_map[tk].index]
+            }
+            # We don't need to pass the actual ticker object since we recreate it in run_single_ticker
+            args_list.append((tk, hist_data_dict, None, data_dir, log_dir, risk_free_rate))
+        
+        # Use parallel processing
+        if max_workers is None:
+            max_workers = min(cpu_count(), len(tickers))
+        
+        print(f"Running in parallel with {max_workers} workers...")
+        results = []
+        
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_ticker = {executor.submit(run_single_ticker, args): args[0] 
+                               for args in args_list}
+            
+            # Collect results as they complete
+            for i, future in enumerate(as_completed(future_to_ticker), 1):
+                ticker = future_to_ticker[future]
+                print(f"[{i}/{len(tickers)}] Completed: {ticker}")
+                try:
+                    result = future.result()
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    print(f"Error processing {ticker}: {e}")
+                    log_message(f"Parallel processing error on {ticker}: {e}", ticker, log_dir)
+    else:
+        # Sequential processing
+        print("Running sequentially...")
+        results = []
+        for i, tk in enumerate(tickers, 1):
+            log_message(f"\n=== Running ticker {i}/{len(tickers)}: {tk} ===", tk, log_dir)
+            try:
+                res = run_hedging_optimization(tk, data_map[tk], ticker_objects[tk], data_dir=data_dir, log_dir=log_dir, risk_free_rate=risk_free_rate)
+                if res is not None:
+                    results.append(res)
+            except Exception as e:
+                log_message(f"Error on {tk}: {e}", tk, log_dir)
+                print(f"Error processing {tk}: {e}")
+    
+    # Save results
+    print(f"\nCompleted processing. Got {len(results)} successful results.")
+    if results:
+        dfp = pd.DataFrame(results)
         outp = os.path.join(data_dir, f"portfolio_best_configs_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
         dfp.to_csv(outp, index=False)
         print(f"Saved portfolio best configs to {outp}")
-    return rows
+    return results
 

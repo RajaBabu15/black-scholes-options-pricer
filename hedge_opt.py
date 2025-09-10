@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import os
+import argparse
 from typing import List
 from datetime import datetime
 import pandas as pd
 
 # High-level harness API
-from optlib.harness.runner import run_hedging_optimization, run
+from optlib.harness.runner import run
 from optlib.data.tickers import default_100_tickers
-from optlib.data.history import load_or_download_hist
+from optlib.data.history import load_data_with_tickers
 
 # Default IO dirs
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
@@ -15,31 +16,47 @@ LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-def main(ticker: str | None = None, tickers: List[str] | None = None, limit: int = 100):
-    """Local-data-first unified entrypoint.
-    - If `tickers` list is None or empty, default to ['AAPL'].
-    - Else use the provided list.
-    - For each ticker, try to load its CSV from DATA_DIR (<TICKER>.csv).
-      Only include tickers whose CSV loads successfully.
-    - Run the portfolio across the filtered tickers.
-    """
-    # Resolve list of tickers
-    if tickers is None or len(tickers) == 0:
-        resolved = ['AAPL']
-    else:
-        resolved = [t.strip().upper() for t in tickers if t and t.strip()]
 
-    # Ensure data exists: load or download tickers; use AAPL fallback if needed
-    from optlib.data.history import load_or_download_many
-    data_map = load_or_download_many(resolved, years=2, data_dir=DATA_DIR)
-    valid_tickers = list(data_map.keys())
-    if not valid_tickers:
-        print("[ERROR] No data available even after download attempts.")
+def main(tickers: List[str] | None = None, limit: int = 100, parallel: bool = True, max_workers: int = None):
+    if tickers is None:
+        tickers = default_100_tickers()
+
+    print(f"Loading data for {len(tickers)} tickers...")
+    data_map, ticker_objects = load_data_with_tickers(tickers, years=2, data_dir=DATA_DIR)
+    print(f"Successfully loaded data for {len(data_map)} tickers: {list(data_map.keys())[:10]}{'...' if len(data_map) > 10 else ''}")
+    
+    if len(data_map) == 0:
+        print("No data loaded. Exiting.")
         return []
-    # Enforce limit and run portfolio
-    valid_tickers = valid_tickers[:max(1, int(limit))]
-    return run_many(tickers=valid_tickers, limit=len(valid_tickers), data_dir=DATA_DIR, log_dir=LOG_DIR)
+    
+    return run(data_map=data_map, ticker_objects=ticker_objects, limit=limit, data_dir=DATA_DIR, log_dir=LOG_DIR, 
+              parallel=parallel, max_workers=max_workers)
+
 
 if __name__ == '__main__':
-    main(tickers=default_100_tickers())
+    parser = argparse.ArgumentParser(
+        description='Run hedge optimization for multiple tickers')
+    parser.add_argument('--limit', type=int, default=5,
+                        help='Maximum number of tickers to process (default: 5 for testing)')
+    parser.add_argument('--no-parallel', action='store_true',
+                        help='Disable parallel processing')
+    parser.add_argument('--max-workers', type=int,
+                        help='Maximum number of worker processes')
+    parser.add_argument('--tickers', nargs='*',
+                        help='Specific tickers to process (e.g., --tickers AAPL MSFT)')
 
+    args = parser.parse_args()
+
+    tickers = args.tickers if args.tickers else None
+    parallel = not args.no_parallel
+
+    print(f"Starting hedge optimization:")
+    print(f"  Limit: {args.limit}")
+    print(f"  Parallel: {parallel}")
+    print(f"  Max workers: {args.max_workers or 'auto'}")
+    print(f"  Specific tickers: {tickers or 'using default 100'}")
+    print()
+
+    results = main(tickers=tickers, limit=args.limit,
+                   parallel=parallel, max_workers=args.max_workers)
+    print(f"\nFinal results: {len(results)} successful optimizations")
