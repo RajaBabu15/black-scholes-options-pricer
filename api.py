@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Compatibility shim
-==================
-
-This module used to contain a monolithic implementation of pricing, simulation,
-hedging, and metrics. The codebase has been modularized into the `optlib`
-package. To maintain backward compatibility, this file re-exports the public API
-from optlib.
+api.py
+======
+Short, stable compatibility shim that re-exports the public optlib API.
+Prefer importing directly from `optlib`, but this module offers a concise alias.
 """
 
 from optlib.utils.tensor import device, tensor_dtype, complex_dtype  # noqa: F401
