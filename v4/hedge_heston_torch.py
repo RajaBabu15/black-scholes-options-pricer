@@ -434,6 +434,18 @@ def delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=0.0008, impact_lambda=0
 
         pnl[i] = cash + Delta_prev * S_path[-1] - payoff
 
+    if return_torch:
+        # Return detached tensors for differentiable training (avoid numpy conversion)
+        diag = {
+            'trades': trades_count.detach(),
+            'avg_spread_cost': (spread_cost_total / (trades_count + 1e-8)).detach(),
+            'avg_impact_cost': (impact_cost_total / (trades_count + 1e-8)).detach(),
+            'total_spread_cost': spread_cost_total.detach(),
+            'total_impact_cost': impact_cost_total.detach(),
+        }
+        return pnl, C0, step_returns, diag
+
+    # Default (numpy outputs)
     diag = {
         'trades': trades_count.cpu().numpy(),
         'avg_spread_cost': (spread_cost_total / (trades_count + 1e-8)).cpu().numpy(),
@@ -441,10 +453,6 @@ def delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=0.0008, impact_lambda=0
         'total_spread_cost': spread_cost_total.cpu().numpy(),
         'total_impact_cost': impact_cost_total.cpu().numpy(),
     }
-
-    if return_torch:
-        # return tensors for differentiable training
-        return pnl, C0, step_returns, diag
     out_pnl = pnl.cpu().numpy()
     out_C0 = C0.cpu().item() if isinstance(C0, torch.Tensor) else C0
     if return_timeseries:
