@@ -25,6 +25,91 @@ from hedge_heston_torch import (
 
 import torch
 
+# === Differentiable metrics (torch) ===
+
+def sharpe_torch(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    mu = returns.mean()
+    sigma = returns.std(unbiased=False) + eps
+    return mu / sigma
+
+def sortino_torch(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    mu = returns.mean()
+    downside = returns[returns < 0.0]
+    if downside.numel() == 0:
+        ds = torch.tensor(1.0, device=returns.device)
+    else:
+        ds = downside.std(unbiased=False) + eps
+    return mu / ds
+
+def compound_equity_from_returns(returns: torch.Tensor, init: float = 1.0) -> torch.Tensor:
+    # returns is 1D (time) torch tensor; equity compounding
+    return torch.cumprod(1.0 + returns, dim=0) * init
+
+def max_drawdown_torch(equity: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # running peak via cumulative maximum
+    peak = torch.maximum.accumulate(equity)
+    dd = (peak - equity) / (peak + eps)
+    return dd.max()
+
+def calmar_torch(ann_return: torch.Tensor, max_dd: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return ann_return / (max_dd + eps)
+
+
+def composite_loss(returns: torch.Tensor, periods_per_year: float) -> torch.Tensor:
+    # returns: 1D time-series torch tensor
+    sh = sharpe_torch(returns)
+    so = sortino_torch(returns)
+    eq = compound_equity_from_returns(returns)
+    mdd = max_drawdown_torch(eq)
+    ann_mu = returns.mean() * periods_per_year
+    ann_vol = returns.std(unbiased=False) * torch.sqrt(torch.tensor(periods_per_year, device=returns.device))
+    ca = calmar_torch(ann_mu, mdd)
+
+    # penalties (target ranges)
+    penalty = torch.tensor(0.0, device=returns.device)
+    penalty += torch.where(sh < 1.0, 10.0 * (1.0 - sh) ** 2, torch.tensor(0.0, device=returns.device))
+    penalty += torch.where(sh > 4.0, 5.0 * (sh - 4.0) ** 2, torch.tensor(0.0, device=returns.device))
+    penalty += torch.where(so < 1.5, 6.0 * (1.5 - so) ** 2, torch.tensor(0.0, device=returns.device))
+    penalty += torch.where(ca < 1.0, 8.0 * (1.0 - ca) ** 2, torch.tensor(0.0, device=returns.device))
+    penalty += torch.where(ann_vol < 0.05, 6.0 * (0.05 - ann_vol) ** 2, torch.tensor(0.0, device=returns.device))
+    penalty += torch.where(ann_vol > 0.25, 6.0 * (ann_vol - 0.25) ** 2, torch.tensor(0.0, device=returns.device))
+
+    # asymmetric heavy penalties for deeply negative performance
+    penalty += torch.where(sh < -0.5, 20.0 * torch.abs(sh + 0.5), torch.tensor(0.0, device=returns.device))
+    penalty += torch.where(so < -0.5, 20.0 * torch.abs(so + 0.5), torch.tensor(0.0, device=returns.device))
+    penalty += torch.where(ca < 0.0, 15.0 * torch.abs(ca), torch.tensor(0.0, device=returns.device))
+    penalty += torch.where(ann_mu < 0.0, 10.0 * torch.abs(ann_mu), torch.tensor(0.0, device=returns.device))
+
+    # hard reject (return huge loss)
+    if (sh.item() < -1.0) or (so.item() < -1.0) or (ca.item() < 0.0):
+        return torch.tensor(1e6, device=returns.device)
+
+    score = 0.5 * sh + 0.3 * so + 0.2 * ca
+    loss = -score + penalty
+    return loss
+
+
+def optimize_exposure_scale(S_paths_t, v_paths_t, times_t, K, r, q, rebal_freq, mode, tc, impact, target_periods_per_year: float, steps: int = 200, lr: float = 5e-2) -> Dict:
+    # Trainable exposure scale in (0,1) via sigmoid(param)
+    scale_param = torch.nn.Parameter(torch.tensor(0.0, dtype=S_paths_t.dtype, device=S_paths_t.device))
+    optimizer = torch.optim.Adam([scale_param], lr=lr)
+
+    for step in range(steps):
+        optimizer.zero_grad()
+        scale = torch.sigmoid(scale_param)
+        pnl_t, C0_t, step_ts_t, diag = delta_hedge_sim(
+            S_paths_t, v_paths_t, times_t, K, r, q,
+            tc=tc, impact_lambda=impact, rebal_freq=rebal_freq,
+            deltas_mode=mode, per_path_deltas=None,
+            exposure_scale=scale, return_timeseries=True, anti_lookahead_checks=True, return_torch=True)
+        # average across paths -> time-series
+        ret_ts = step_ts_t.mean(dim=0)
+        loss = composite_loss(ret_ts, periods_per_year=target_periods_per_year)
+        loss.backward()
+        optimizer.step()
+    # return learned scale
+    return {'scale': torch.sigmoid(scale_param).detach().cpu().item()}
+
 def choose_expiries(stock: yf.Ticker, min_td=10, max_td=100, targets=(30,60,90)) -> List[str]:
     expiries = stock.options
     today = pd.Timestamp.utcnow().tz_localize(None)
@@ -139,36 +224,84 @@ def calibrate_heston_multi(stock: yf.Ticker, S0: float, r: float, q: float, expi
 def evaluate_configs(S_paths, v_paths, times, K, r, q, per_path_deltas, configs, verbose=True):
     rows=[]
     total = len(configs)
+    # compute steps_per_year from timeline
+    T = float(times[-1]) if hasattr(times, '__len__') else 1.0
+    steps_per_day = max(int(round((len(times)-1) / max(T*252, 1e-8))), 1)
+    periods_per_year = 252 * steps_per_day
+    base_seed = int(time.time()) % 10_000_000
     for i, cfg in enumerate(configs, 1):
         rebal, tc, impact, scale, mode = cfg
+        rand_seed = base_seed + i
         if verbose:
-            print(f"  [{i}/{total}] rebal={rebal}, tc={tc:.4f}, impact={impact:.1e}, scale={scale:.2f}, mode={mode}", flush=True)
+            print(f"  [{i}/{total}] rebal={rebal}, tc={tc:.4f}, impact={impact:.1e}, scale={scale:.2f}, mode={mode}, seed={rand_seed}", flush=True)
         try:
             t0 = time.time()
             with torch.no_grad():
-                pnl,_ = delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=tc, impact_lambda=impact, rebal_freq=rebal, deltas_mode=mode, per_path_deltas=per_path_deltas if mode=='perpath' else None, exposure_scale=scale)
-            met = calculate_performance_metrics(pnl, risk_free_rate=r)
-            score = 0.5*met['sharpe_ratio'] + 0.3*met['sortino_ratio'] + 0.2*met['calmar_ratio']
+                pnl, C0, step_ts, diag = delta_hedge_sim(
+                    S_paths, v_paths, times, K, r, q,
+                    tc=tc, impact_lambda=impact, rebal_freq=rebal,
+                    deltas_mode=mode, per_path_deltas=per_path_deltas if mode=='perpath' else None,
+                    exposure_scale=scale, return_timeseries=True, anti_lookahead_checks=True)
+            # bootstrap across paths for this config to avoid reusing same seed deterministically
+            if step_ts is None:
+                raise RuntimeError("step time series not returned")
+            np.random.seed(rand_seed)
+            idx = np.random.choice(step_ts.shape[0], size=step_ts.shape[0], replace=True)
+            step_series = step_ts[idx].mean(axis=0)  # average return across resampled paths
+            # compute metrics on time series
+            met = calculate_performance_metrics(step_series, risk_free_rate=r, periods_per_year=float(periods_per_year))
+            # penalty function
             penalty = 0.0
-            if met['max_drawdown']>0.2: penalty -= 0.5
-            if met['annual_volatility']>0.20: penalty -= 0.5
+            sh, so, ca = met['sharpe_ratio'], met['sortino_ratio'], met['calmar_ratio']
+            dd, av = met['max_drawdown'], met['annual_volatility']
+            # hard rejections
+            if not np.isfinite(sh) or not np.isfinite(so) or not np.isfinite(ca) or not np.isfinite(dd) or not np.isfinite(av):
+                raise RuntimeError("NaN/Inf metric detected")
+            if scale > 1.0:
+                raise RuntimeError("Exposure scale > 1.0 not allowed")
+            # penalties (symmetric around target ranges)
+            if sh < 1.0: penalty += 10.0 * (1.0 - sh)**2
+            if sh > 4.0: penalty += 5.0 * (sh - 4.0)**2
+            if so < 1.5: penalty += 6.0 * (1.5 - so)**2
+            if ca < 1.0: penalty += 8.0 * (1.0 - ca)**2
+            if dd > 0.25: penalty += 12.0 * (dd - 0.25)**2
+            if av < 0.05: penalty += 6.0 * (0.05 - av)**2
+            if av > 0.25: penalty += 6.0 * (av - 0.25)**2
+            # asymmetric heavy penalties for deeply negative performance
+            if sh < -0.5: penalty += 20.0 * abs(sh + 0.5)
+            if so < -0.5: penalty += 20.0 * abs(so + 0.5)
+            if ca < 0.0:  penalty += 15.0 * abs(ca)
+            if met['annual_return'] < 0.0: penalty += 10.0 * abs(met['annual_return'])
+            # hard rejections for hopeless configs
+            if (sh < -1.0) or (so < -1.0) or (ca < 0.0):
+                raise RuntimeError(f"Hard reject: sh={sh:.3f}, so={so:.3f}, ca={ca:.3f}")
+            score = 0.5*sh + 0.3*so + 0.2*ca - penalty
+            meets_gates = (1.0 <= sh <= 3.0) and (1.5 <= so <= 4.0) and (ca >= 1.0) and (dd <= 0.25) and (0.05 <= av <= 0.25)
             if verbose:
-                print(f"     -> score={score+penalty:.3f}, sharpe={met['sharpe_ratio']:.3f}, calmar={met['calmar_ratio']:.3f}, vol={met['annual_volatility']:.3f} (took {time.time()-t0:.2f}s)", flush=True)
+                print(f"     -> score={score:.3f}, pen={penalty:.3f}, Sharpe={sh:.3f}, Sortino={so:.3f}, Calmar={ca:.3f}, DD={dd:.3f}, Vol={av:.3f} (took {time.time()-t0:.2f}s)", flush=True)
             rows.append({
                 'rebal': rebal,
                 'tc': tc,
                 'impact': impact,
                 'scale': scale,
                 'mode': mode,
-                'score': score+penalty,
-                **met
+                'random_seed': rand_seed,
+                'score': score,
+                'penalty': penalty,
+                'meets_gates': bool(meets_gates),
+                **met,
+                'num_trades_mean': float(np.mean(diag['trades'])),
+                'avg_spread_cost_mean': float(np.mean(diag['avg_spread_cost'])),
+                'avg_impact_cost_mean': float(np.mean(diag['avg_impact_cost'])),
             })
         except KeyboardInterrupt:
             print("Evaluation interrupted by user.", flush=True)
             break
         except Exception as e:
-            print(f"     -> skipped due to error: {e}", flush=True)
-            rows.append({'rebal': rebal,'tc': tc,'impact': impact,'scale': scale,'mode': mode,'score': -999,'total_pnl':0.0,'annual_return':0.0,'annual_volatility':0.0,'sharpe_ratio':0.0,'sortino_ratio':0.0,'max_drawdown':0.0,'calmar_ratio':0.0})
+            print(f"     -> REJECTED due to error: {e}", flush=True)
+            rows.append({'rebal': rebal,'tc': tc,'impact': impact,'scale': scale,'mode': mode,'random_seed': rand_seed,'score': -999.0,'penalty': 0.0,'meets_gates': False,
+                         'total_pnl':0.0,'annual_return':0.0,'annual_volatility':np.nan,'sharpe_ratio':np.nan,'sortino_ratio':np.nan,'max_drawdown':np.nan,'calmar_ratio':np.nan,
+                         'num_trades_mean':0.0,'avg_spread_cost_mean':0.0,'avg_impact_cost_mean':0.0})
     return pd.DataFrame(rows)
 
 def main(ticker='AAPL'):
@@ -238,6 +371,55 @@ def main(ticker='AAPL'):
 
     df_sorted = df.sort_values('score', ascending=False)
     print("Top 10 configs by score:\n", df_sorted.head(10), flush=True)
+
+    # Optional: refine top-2 with differentiable exposure_scale training (fast)
+    try_train = True
+    if try_train:
+        try:
+            top = df_sorted.head(2).copy()
+            print("Training exposure_scale with backprop on top-2 configs...", flush=True)
+            # simulate a fresh training set (different seed)
+            torch.manual_seed(int(time.time()) % 1_000_000)
+            n_steps_train = max(int(T*252*steps_per_day_eval), 200)
+            n_paths_train = 120
+            S_paths_train, v_paths_train = generate_heston_paths(S0, r, q, T, kappa, theta, sigma_v, rho, v0, n_paths_train, n_steps_train)
+            times_train = torch.linspace(0., T, n_steps_train+1, dtype=tensor_dtype)
+            periods_per_year = 252 * steps_per_day_eval
+            trained_rows = []
+            for _, row in top.iterrows():
+                cfg = (int(row['rebal']), float(row['tc']), float(row['impact']), float(row['scale']), 'bs')
+                rebal, tc_v, impact_v, scale0, mode_v = cfg
+                print(f"  Training scale for rebal={rebal}, tc={tc_v}, impact={impact_v}", flush=True)
+                res = optimize_exposure_scale(S_paths_train, v_paths_train, times_train, K, r, q, rebal, mode_v, tc_v, impact_v, target_periods_per_year=periods_per_year, steps=100, lr=0.05)
+                scale_star = res['scale']
+                print(f"   -> learned scale={scale_star:.3f}", flush=True)
+                # evaluate on eval set with learned scale
+                pnl_e, C0_e, step_ts_e, diag_e = delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=tc_v, impact_lambda=impact_v, rebal_freq=rebal, deltas_mode=mode_v, exposure_scale=scale_star, return_timeseries=True, anti_lookahead_checks=True)
+                ret_series = step_ts_e.mean(axis=0)
+                met_e = calculate_performance_metrics(ret_series, risk_free_rate=r, periods_per_year=float(periods_per_year))
+                sh, so, ca = met_e['sharpe_ratio'], met_e['sortino_ratio'], met_e['calmar_ratio']
+                dd, av = met_e['max_drawdown'], met_e['annual_volatility']
+                penalty = 0.0
+                if sh < 1.0: penalty += 10.0 * (1.0 - sh)**2
+                if sh > 4.0: penalty += 5.0 * (sh - 4.0)**2
+                if so < 1.5: penalty += 6.0 * (1.5 - so)**2
+                if ca < 1.0: penalty += 8.0 * (1.0 - ca)**2
+                if dd > 0.25: penalty += 12.0 * (dd - 0.25)**2
+                if av < 0.05: penalty += 6.0 * (0.05 - av)**2
+                if av > 0.25: penalty += 6.0 * (av - 0.25)**2
+                if sh < -0.5: penalty += 20.0 * abs(sh + 0.5)
+                if so < -0.5: penalty += 20.0 * abs(so + 0.5)
+                if ca < 0.0:  penalty += 15.0 * abs(ca)
+                if met_e['annual_return'] < 0.0: penalty += 10.0 * abs(met_e['annual_return'])
+                score = 0.5*sh + 0.3*so + 0.2*ca - penalty
+                trained_rows.append({'mode': mode_v, 'rebal': rebal, 'tc': tc_v, 'impact': impact_v, 'scale': scale_star, 'score': score, **met_e,
+                                     'num_trades_mean': float(np.mean(diag_e['trades'])),
+                                     'avg_spread_cost_mean': float(np.mean(diag_e['avg_spread_cost'])),
+                                     'avg_impact_cost_mean': float(np.mean(diag_e['avg_impact_cost']))})
+            df_trained = pd.DataFrame(trained_rows).sort_values('score', ascending=False)
+            print("Backprop-trained results:\n", df_trained.head(10), flush=True)
+        except Exception as e:
+            print(f"Differentiable training skipped: {e}", flush=True)
 
     # Optional: refine top-3 with per-path deltas and higher fidelity
     do_refine = False  # disable by default to avoid long runtimes
