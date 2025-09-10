@@ -136,38 +136,52 @@ def calibrate_heston_multi(stock: yf.Ticker, S0: float, r: float, q: float, expi
         return params0.tolist()
     return res.x.tolist()
 
-def evaluate_configs(S_paths, v_paths, times, K, r, q, per_path_deltas, configs):
+def evaluate_configs(S_paths, v_paths, times, K, r, q, per_path_deltas, configs, verbose=True):
     rows=[]
-    for cfg in configs:
+    total = len(configs)
+    for i, cfg in enumerate(configs, 1):
         rebal, tc, impact, scale, mode = cfg
-        pnl,_ = delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=tc, impact_lambda=impact, rebal_freq=rebal, deltas_mode=mode, per_path_deltas=per_path_deltas if mode=='perpath' else None, exposure_scale=scale)
-        met = calculate_performance_metrics(pnl, risk_free_rate=r)
-        score = 0.5*met['sharpe_ratio'] + 0.3*met['sortino_ratio'] + 0.2*met['calmar_ratio']
-        penalty = 0.0
-        if met['max_drawdown']>0.2: penalty -= 0.5
-        if met['annual_volatility']>0.20: penalty -= 0.5
-        rows.append({
-            'rebal': rebal,
-            'tc': tc,
-            'impact': impact,
-            'scale': scale,
-            'mode': mode,
-            'score': score+penalty,
-            **met
-        })
+        if verbose:
+            print(f"  [{i}/{total}] rebal={rebal}, tc={tc:.4f}, impact={impact:.1e}, scale={scale:.2f}, mode={mode}", flush=True)
+        try:
+            t0 = time.time()
+            with torch.no_grad():
+                pnl,_ = delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=tc, impact_lambda=impact, rebal_freq=rebal, deltas_mode=mode, per_path_deltas=per_path_deltas if mode=='perpath' else None, exposure_scale=scale)
+            met = calculate_performance_metrics(pnl, risk_free_rate=r)
+            score = 0.5*met['sharpe_ratio'] + 0.3*met['sortino_ratio'] + 0.2*met['calmar_ratio']
+            penalty = 0.0
+            if met['max_drawdown']>0.2: penalty -= 0.5
+            if met['annual_volatility']>0.20: penalty -= 0.5
+            if verbose:
+                print(f"     -> score={score+penalty:.3f}, sharpe={met['sharpe_ratio']:.3f}, calmar={met['calmar_ratio']:.3f}, vol={met['annual_volatility']:.3f} (took {time.time()-t0:.2f}s)", flush=True)
+            rows.append({
+                'rebal': rebal,
+                'tc': tc,
+                'impact': impact,
+                'scale': scale,
+                'mode': mode,
+                'score': score+penalty,
+                **met
+            })
+        except KeyboardInterrupt:
+            print("Evaluation interrupted by user.", flush=True)
+            break
+        except Exception as e:
+            print(f"     -> skipped due to error: {e}", flush=True)
+            rows.append({'rebal': rebal,'tc': tc,'impact': impact,'scale': scale,'mode': mode,'score': -999,'total_pnl':0.0,'annual_return':0.0,'annual_volatility':0.0,'sharpe_ratio':0.0,'sortino_ratio':0.0,'max_drawdown':0.0,'calmar_ratio':0.0})
     return pd.DataFrame(rows)
 
 def main(ticker='AAPL'):
-    print(f"=== Optimization Harness for {ticker} ===")
+    print(f"=== Optimization Harness for {ticker} ===", flush=True)
     stock = yf.Ticker(ticker)
     r = fetch_risk_free_rate(fallback_rate=0.041)
     q = fetch_dividend_yield(ticker, fallback_yield=0.004)
     S0 = float(stock.history(period='5d')['Close'].iloc[-1])
-    print(f"S0={S0:.2f}, r={r:.3f}, q={q:.4f}")
+    print(f"S0={S0:.2f}, r={r:.3f}, q={q:.4f}", flush=True)
 
     exps = choose_expiries(stock)
     if len(exps)==0:
-        print("No suitable expiries found.")
+        print("No suitable expiries found.", flush=True)
         return
 
     strikes_by_exp={}; prices_by_exp={}; T_by_exp={}
@@ -176,12 +190,14 @@ def main(ticker='AAPL'):
         strikes_by_exp[exp] = Ks
         prices_by_exp[exp] = mids
         T_by_exp[exp] = T
-        print(f"Expiry {exp}: {len(Ks)} options, T={T:.3f}y")
+        print(f"Expiry {exp}: {len(Ks)} options, T={T:.3f}y", flush=True)
 
-    # Calibrate Heston across these expiries
+    # Calibrate Heston across these expiries (FAST)
+    t0=time.time()
     params = calibrate_heston_multi(stock, S0, r, q, exps, strikes_by_exp, prices_by_exp, T_by_exp)
     kappa, theta, sigma_v, rho, v0 = params
-    print(f"Calibrated params: kappa={kappa:.3f}, theta={theta:.4f}, sigma_v={sigma_v:.3f}, rho={rho:.3f}, v0={v0:.4f}")
+    print(f"Calibrated params: kappa={kappa:.3f}, theta={theta:.4f}, sigma_v={sigma_v:.3f}, rho={rho:.3f}, v0={v0:.4f}", flush=True)
+    print(f"Calibration took {time.time()-t0:.2f}s", flush=True)
 
     # Choose target expiry (closest to 60d)
     target_exp = exps[1] if len(exps)>1 else exps[0]
@@ -189,39 +205,77 @@ def main(ticker='AAPL'):
     Ks = strikes_by_exp[target_exp]
     mids = prices_by_exp[target_exp]
     if len(Ks)==0:
-        print("No options in target expiry.")
+        print("No options in target expiry.", flush=True)
         return
     K = float(np.median(Ks))
 
+    # FAST EVAL SETTINGS
+    fast_eval = True
+    steps_per_day_eval = 8 if fast_eval else 24
+    n_paths_eval = 150 if fast_eval else 500
+
     # Simulate Heston paths
-    n_steps = max(int(T*252*24), 60)
-    n_paths = 500
+    print("Simulating Heston paths...", flush=True)
+    n_steps = max(int(T*252*steps_per_day_eval), 120)
+    n_paths = n_paths_eval
+    t1=time.time()
     S_paths, v_paths = generate_heston_paths(S0, r, q, T, kappa, theta, sigma_v, rho, v0, n_paths, n_steps)
     times = torch.linspace(0., T, n_steps+1, dtype=tensor_dtype)
+    print(f"Simulated {n_paths} paths with {n_steps} steps in {time.time()-t1:.2f}s", flush=True)
 
-    # Per-path deltas (for comparison)
-    per_path_deltas = compute_per_path_deltas_scaling(S_paths.cpu().numpy(), K, times.cpu().numpy(), r, q, relative_eps=0.001)
-
-    # Build config grid
-    rebal_list = [1,2,5,10,20]
-    tc_list = [0.0002,0.0005,0.001,0.002]
+    # Build config grid (BS only for fast evaluation)
+    rebal_list = [2,5,10]
+    tc_list = [0.0005,0.001]
     impact_list = [0.0, 1e-6]
-    scale_list = [0.5, 0.8, 1.0]
-    modes = ['bs','perpath']
+    scale_list = [0.8, 1.0]
+    modes = ['bs']
     configs = [(a,b,c,d,e) for a in rebal_list for b in tc_list for c in impact_list for d in scale_list for e in modes]
 
-    df = evaluate_configs(S_paths, v_paths, times, K, r, q, per_path_deltas, configs)
+    print(f"Evaluating {len(configs)} configs (fast BS-only)...", flush=True)
+    t2=time.time()
+    df = evaluate_configs(S_paths, v_paths, times, K, r, q, per_path_deltas=None, configs=configs)
+    print(f"Evaluation completed in {time.time()-t2:.2f}s", flush=True)
+
     df_sorted = df.sort_values('score', ascending=False)
-    print("Top 10 configs by score:\n", df_sorted.head(10))
+    print("Top 10 configs by score:\n", df_sorted.head(10), flush=True)
+
+    # Optional: refine top-3 with per-path deltas and higher fidelity
+    do_refine = False  # disable by default to avoid long runtimes
+    if do_refine:
+        try:
+            top = df_sorted.head(3).copy()
+            print("Refining top-3 with per-path deltas and higher fidelity...", flush=True)
+            steps_per_day_final = 24
+            n_paths_final = 400
+            n_steps_f = max(int(T*252*steps_per_day_final), 240)
+            print(f"Re-simulating {n_paths_final} paths x {n_steps_f} steps...", flush=True)
+            S_paths_f, v_paths_f = generate_heston_paths(S0, r, q, T, kappa, theta, sigma_v, rho, v0, n_paths_final, n_steps_f)
+            times_f = torch.linspace(0., T, n_steps_f+1, dtype=tensor_dtype)
+            print("Computing per-path deltas (this can take a while)...", flush=True)
+            ppd = compute_per_path_deltas_scaling(S_paths_f.cpu().numpy(), K, times_f.cpu().numpy(), r, q, relative_eps=0.001)
+            refined_rows=[]
+            for _, row in top.iterrows():
+                cfg_bs = (int(row['rebal']), float(row['tc']), float(row['impact']), float(row['scale']), 'bs')
+                cfg_pp = (int(row['rebal']), float(row['tc']), float(row['impact']), float(row['scale']), 'perpath')
+                for cfg in [cfg_bs, cfg_pp]:
+                    pnl,_ = delta_hedge_sim(S_paths_f, v_paths_f, times_f, K, r, q, tc=cfg[1], impact_lambda=cfg[2], rebal_freq=cfg[0], deltas_mode=cfg[4], per_path_deltas=ppd if cfg[4]=='perpath' else None, exposure_scale=cfg[3])
+                    met = calculate_performance_metrics(pnl, risk_free_rate=r)
+                    score = 0.5*met['sharpe_ratio'] + 0.3*met['sortino_ratio'] + 0.2*met['calmar_ratio']
+                    refined_rows.append({'mode': cfg[4], 'rebal': cfg[0], 'tc': cfg[1], 'impact': cfg[2], 'scale': cfg[3], 'score': score, **met})
+            df_refined = pd.DataFrame(refined_rows).sort_values('score', ascending=False)
+            print("Refined results:\n", df_refined.head(10), flush=True)
+        except KeyboardInterrupt:
+            print("Refinement interrupted by user.", flush=True)
+        except Exception as e:
+            print(f"Refinement skipped due to error: {e}", flush=True)
 
     # Acceptance gates
     best = df_sorted.iloc[0]
     ok = (best['sharpe_ratio']>=1.0 and best['sortino_ratio']>=1.0 and best['calmar_ratio']>=0.5 and best['max_drawdown']<=0.25 and best['annual_volatility']<=0.20)
-    print("\nBest config meets gates:", ok)
+    print("\nBest fast-eval config meets gates:", ok, flush=True)
     out_path = f"opt_results_{ticker}.csv"
     df.to_csv(out_path, index=False)
-    print(f"Saved all config results to {out_path}")
-
+    print(f"Saved all config results to {out_path}", flush=True)
 if __name__ == '__main__':
     main()
 
