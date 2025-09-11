@@ -21,9 +21,7 @@ def main(tickers: List[str] | None = None, limit: int = 100, parallel: bool = Tr
     if tickers is None:
         tickers = default_100_tickers()
 
-    print(f"Loading data for {len(tickers)} tickers...")
     data_map, ticker_objects = load_data_with_tickers(tickers, years=2, data_dir=DATA_DIR)
-    print(f"Successfully loaded data for {len(data_map)} tickers: {list(data_map.keys())[:10]}{'...' if len(data_map) > 10 else ''}")
     
     if len(data_map) == 0:
         print("No data loaded. Exiting.")
@@ -50,13 +48,6 @@ if __name__ == '__main__':
     tickers = args.tickers if args.tickers else None
     parallel = not args.no_parallel
 
-    print(f"Starting hedge optimization:")
-    print(f"  Limit: {args.limit}")
-    print(f"  Parallel: {parallel}")
-    print(f"  Max workers: {args.max_workers or 'auto'}")
-    print(f"  Specific tickers: {tickers or 'using default 100'}")
-    print()
 
     results = main(tickers=tickers, limit=args.limit,
                    parallel=parallel, max_workers=args.max_workers)
-    print(f"\nFinal results: {len(results)} successful optimizations")

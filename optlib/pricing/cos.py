@@ -2,8 +2,10 @@ import math
 import torch
 from optlib.utils.tensor import tensor_dtype
 import logging
-logger = logging.getLogger(__name__)
 
+# Reduce verbosity for COS pricing
+logging.getLogger(__name__).setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 def cos_price_from_cf(S0, K, r, q, T, cf_func, params=None):
     """COS method pricing with adaptive parameters and numerical c2 calculation.
     Runs on CPU float64 for numerical stability. Supports vectorized K.
@@ -29,7 +31,8 @@ def cos_price_from_cf(S0, K, r, q, T, cf_func, params=None):
             log_phi_0 = torch.log(phi_0)
             c2_num = - (log_phi_pos.real - 2 * log_phi_0.real + log_phi_neg.real) / (h ** 2)
             c2 = max(1e-8, float(c2_num))
-            logger.debug(f"Numerical c2: {c2:.6f} for params {params[:5]}")
+    # Reduced verbosity - only log occasionally
+    # logger.debug(f"Numerical c2: {c2:.6f} for params {params}")
         except Exception as e:
             logger.warning(f"Failed numerical c2: {e}, falling back to approx")
             c2 = (
@@ -46,7 +49,7 @@ def cos_price_from_cf(S0, K, r, q, T, cf_func, params=None):
         N = min(N, 2048)
         L = max(10, int(10 + 5 * volatility_of_vol + 2 * time_scaling))
         L = min(L, 25)
-        logger.debug(f"Adaptive N={N}, L={L}, c2={c2:.6f}")
+    # Reduced verbosity - removed iteration logging
     else:
         market_vol = 0.25
         c2 = T * market_vol**2 + 0.5 * T**2 * market_vol**2

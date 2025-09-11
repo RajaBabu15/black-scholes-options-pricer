@@ -1,105 +1,115 @@
+"""
+Vectorized scale optimization that tests multiple scales in parallel
+"""
 import torch
-from typing import Dict
+from typing import Dict, List
+from optlib.hedge.delta import delta_hedge_sim_vectorized
+from optlib.utils.tensor import tensor_dtype, device
 
-
-def sharpe_torch(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    mu = returns.mean()
-    sigma = returns.std(unbiased=False) + eps
-    return mu / sigma
-
-
-def sortino_torch(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    mu = returns.mean()
-    downside = returns[returns < 0.0]
-    if downside.numel() == 0:
-        ds = torch.ones(1, device=returns.device, dtype=returns.dtype)
-    else:
-        ds = downside.std(unbiased=False) + eps
-    return mu / ds
-
-
-def compound_equity_from_returns(returns: torch.Tensor, init: float = 1.0) -> torch.Tensor:
-    return torch.cumprod(1.0 + returns, dim=0) * init
-
-
-def max_drawdown_torch(equity: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    peak = torch.cummax(equity, dim=0).values
-    dd = (peak - equity) / (peak + eps)
-    return dd.max()
-
-
-def calmar_torch(ann_return: torch.Tensor, max_dd: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return ann_return / (max_dd + eps)
-
-
-def composite_loss(returns: torch.Tensor, periods_per_year: float) -> torch.Tensor:
-    sh = sharpe_torch(returns)
-    so = sortino_torch(returns)
-    eq = compound_equity_from_returns(returns)
-    mdd = max_drawdown_torch(eq)
-    ann_mu = returns.mean() * periods_per_year
-    periods_tensor = torch.tensor(periods_per_year, device=returns.device, dtype=returns.dtype)
-    ann_vol = returns.std(unbiased=False) * torch.sqrt(periods_tensor)
-    ca = calmar_torch(ann_mu, mdd)
-
-    penalty = torch.zeros(1, device=returns.device, dtype=returns.dtype)
-    zero_tensor = torch.zeros(1, device=returns.device, dtype=returns.dtype)
-    penalty += torch.where(sh < 1.0, 10.0 * (1.0 - sh) ** 2, zero_tensor)
-    penalty += torch.where(sh > 4.0, 5.0 * (sh - 4.0) ** 2, zero_tensor)
-    penalty += torch.where(so < 1.5, 6.0 * (1.5 - so) ** 2, zero_tensor)
-    penalty += torch.where(ca < 1.0, 8.0 * (1.0 - ca) ** 2, zero_tensor)
-    penalty += torch.where(ann_vol < 0.05, 6.0 * (0.05 - ann_vol) ** 2, zero_tensor)
-    penalty += torch.where(ann_vol > 0.25, 6.0 * (ann_vol - 0.25) ** 2, zero_tensor)
-
-    penalty += torch.where(sh < -0.5, 20.0 * torch.abs(sh + 0.5), zero_tensor)
-    penalty += torch.where(so < -0.5, 20.0 * torch.abs(so + 0.5), zero_tensor)
-    penalty += torch.where(ca < 0.0, 15.0 * torch.abs(ca), zero_tensor)
-    penalty += torch.where(ann_mu < 0.0, 10.0 * torch.abs(ann_mu), zero_tensor)
-
-    # Use differentiable operations to avoid breaking gradient chain
-    hard_reject_penalty = torch.zeros(1, device=returns.device, dtype=returns.dtype)
-    large_penalty = torch.tensor(1e6, device=returns.device, dtype=returns.dtype)
-    hard_reject_penalty += torch.where(sh < -1.0, large_penalty, zero_tensor)
-    hard_reject_penalty += torch.where(so < -1.0, large_penalty, zero_tensor) 
-    hard_reject_penalty += torch.where(ca < 0.0, large_penalty, zero_tensor)
-
-    score = 0.5 * sh + 0.3 * so + 0.2 * ca
-    loss = -score + penalty + hard_reject_penalty
-    return loss
-
-
-def optimize_exposure_scale_simple_fallback(S_paths_t, v_paths_t, times_t, K, r, q, rebal_freq, mode, tc, impact, target_periods_per_year: float) -> Dict:
-    """Simple fallback that tests a few fixed scales without gradient optimization"""
-    from optlib.hedge.delta import delta_hedge_sim
+def compute_batch_sharpe_ratio(step_returns_batch, eps=1e-8):
+    """
+    Compute Sharpe ratios for batch of return series
     
-    print("Using simple fallback optimization...")
-    scales_to_test = [0.3, 0.5, 0.7, 0.9, 1.0]
-    best_scale = 0.5
+    Args:
+        step_returns_batch: (n_scales, n_paths, n_steps) return series for different scales
+        eps: small number to avoid division by zero
+    
+    Returns:
+        sharpe_ratios: (n_scales,) Sharpe ratios for each scale
+    """
+    # Compute mean returns across paths and time: (n_scales,)
+    mean_returns = step_returns_batch.mean(dim=(1, 2))  
+    
+    # Compute standard deviation across paths and time: (n_scales,)
+    std_returns = step_returns_batch.view(step_returns_batch.shape[0], -1).std(dim=1, unbiased=False)
+    
+    # Compute Sharpe ratios
+    sharpe_ratios = mean_returns / (std_returns + eps)
+    
+    return sharpe_ratios
+
+def batch_delta_hedge_sim_vectorized(S_paths, v_paths, times, K, r, q, scales_to_test,
+                                   rebal_freq, tc, impact):
+    """
+    Run delta hedge simulation for multiple scales in parallel
+    
+    Args:
+        S_paths, v_paths, times: Path data
+        K, r, q: Option parameters
+        scales_to_test: List of exposure scales to test
+        rebal_freq, tc, impact: Trading parameters
+        
+    Returns:
+        results: List of (pnl, step_returns, diag) for each scale
+    """
+    n_scales = len(scales_to_test)
+    results = []
+    
+    # Since we need to modify exposure scaling, we run each scale separately
+    # but use the vectorized simulation for each
+    for scale in scales_to_test:
+        pnl, C0, step_returns, diag = delta_hedge_sim_vectorized(
+            S_paths, v_paths, times, K, r, q,
+            tc=tc, impact_lambda=impact, rebal_freq=rebal_freq,
+            exposure_scale=scale, return_timeseries=True, return_torch=True
+        )
+        results.append((pnl, step_returns, diag))
+    
+    return results
+
+def optimize_exposure_scale_vectorized(S_paths_t, v_paths_t, times_t, K, r, q, rebal_freq,
+                                     mode, tc, impact, target_periods_per_year: float) -> Dict:
+    """
+    Vectorized exposure scale optimization using batch processing
+    """
+    # Original scale testing with full training data
+    max_test_paths = 200  # Restored from 100 to 200
+    n_paths = S_paths_t.shape[0]
+    if n_paths > max_test_paths:
+        S_test = S_paths_t[:max_test_paths]
+        v_test = v_paths_t[:max_test_paths]
+    else:
+        S_test = S_paths_t
+        v_test = v_paths_t
+    
+    # Use more time steps for better accuracy
+    n_timesteps = times_t.shape[0]
+    if n_timesteps > 50:  # Increased threshold from 25 to 50
+        step_indices = torch.arange(0, n_timesteps, 2, device=times_t.device)  # Every 2nd step instead of 3rd
+        if step_indices[-1] != n_timesteps - 1:
+            step_indices = torch.cat([step_indices, torch.tensor([n_timesteps - 1], device=times_t.device)])
+        times_test = times_t[step_indices]
+        S_test = S_test[:, step_indices]
+        v_test = v_test[:, step_indices]
+    else:
+        times_test = times_t
+    
+    # Extreme scale testing range for target performance (Sharpe=1.0, Return=30%)
+    scales_to_test = [0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 3.0]  # Very wide exposure range
+    
+    # Run batch simulation
+    results = batch_delta_hedge_sim_vectorized(
+        S_test, v_test, times_test, K, r, q, scales_to_test, 
+        rebal_freq, tc, impact
+    )
+    
+    # Evaluate each scale
+    best_scale = scales_to_test[0]
     best_score = float('-inf')
     
-    for scale in scales_to_test:
-        try:
-            pnl, C0, step_ts, diag = delta_hedge_sim(
-                S_paths_t.detach().cpu().numpy(), v_paths_t.detach().cpu().numpy(), times_t.detach().cpu().numpy(), 
-                K, r, q, tc=tc, impact_lambda=impact, rebal_freq=rebal_freq,
-                deltas_mode=mode, exposure_scale=scale, return_timeseries=True, return_torch=False)
+    for i, (scale, (pnl, step_returns, diag)) in enumerate(zip(scales_to_test, results)):
+        if step_returns is not None:
+            # Compute Sharpe ratio across all paths and steps
+            ret_flat = step_returns.view(-1)  # Flatten to 1D
+            sharpe = ret_flat.mean() / (ret_flat.std(unbiased=False) + 1e-8)
+            sharpe_val = float(sharpe)
             
-            if step_ts is not None:
-                ret_series = step_ts.mean(axis=0)
-                sharpe = ret_series.mean() / (ret_series.std() + 1e-8)
-                if sharpe > best_score:
-                    best_score = sharpe
-                    best_scale = scale
-                    
-        except Exception as e:
-            print(f"Error testing scale {scale}: {e}")
-            continue
-    
-    print(f"Simple optimization completed. Best scale: {best_scale:.3f}")
+            if sharpe_val > best_score:
+                best_score = sharpe_val
+                best_scale = scale
     return {'scale': best_scale}
 
-
-def optimize_exposure_scale(S_paths_t, v_paths_t, times_t, K, r, q, rebal_freq, mode, tc, impact, target_periods_per_year: float, steps: int = 200, lr: float = 5e-2) -> Dict:
-    """Primary optimization using simple grid search - gradient optimization is too slow/unstable"""
-    return optimize_exposure_scale_simple_fallback(S_paths_t, v_paths_t, times_t, K, r, q, rebal_freq, mode, tc, impact, target_periods_per_year)
-
+# Convenience function that maintains the same interface as the original
+def optimize_exposure_scale(S_paths_t, v_paths_t, times_t, K, r, q, rebal_freq, mode, tc, impact, target_periods_per_year: float) -> Dict:
+    """Wrapper function that uses vectorized optimization"""
+    return optimize_exposure_scale_vectorized(S_paths_t, v_paths_t, times_t, K, r, q, rebal_freq, mode, tc, impact, target_periods_per_year)
