@@ -17,6 +17,7 @@ from optlib.utils.tensor import tensor_dtype
 from optlib.optimization.scale import optimize_exposure_scale
 from optlib.hedge.delta import delta_hedge_sim
 from optlib.metrics.performance import calculate_performance_metrics
+from optlib.utils.cache import get_ticker_registry
 import pandas.tseries.offsets as offsets  # For business days
 
 def log_message(msg: str, ticker: str, log_dir: str):
@@ -31,11 +32,11 @@ def log_message(msg: str, ticker: str, log_dir: str):
     except Exception:
         pass
 
-def run_hedging_optimization(ticker: str, hist_data: pd.DataFrame, stock_ticker: object, data_dir: str, log_dir: str, risk_free_rate: float = None, heston_params: list = None) -> Dict:
+def run_hedging_optimization(ticker: str, hist_data: pd.DataFrame, stock_ticker: object, data_dir: str, log_dir: str, risk_free_rate: float) -> Dict:
     log = lambda m: log_message(m, ticker, log_dir)
     log(f"=== Optimization Harness for {ticker} ===")
-    # Market params and S0
-    r = risk_free_rate if risk_free_rate is not None else fetch_risk_free_rate(fallback_rate=0.041)
+    # Market params and S0 - use passed risk_free_rate to avoid redundant fetching
+    r = risk_free_rate
     q = fetch_dividend_yield(ticker, fallback_yield=0.004)
     hist = hist_data
     S0 = float(hist['Close'].iloc[-1])
@@ -193,10 +194,10 @@ def run_hedging_optimization(ticker: str, hist_data: pd.DataFrame, stock_ticker:
 def run_single_ticker(args):
     """Wrapper for parallel processing"""
     ticker, hist_data_bytes, data_dir, log_dir, risk_free_rate = args
-    # Deserialize DataFrame and ticker
+    # Deserialize DataFrame and get ticker from registry
     hist_data = cloudpickle.loads(hist_data_bytes)
-    import yfinance as yf
-    stock_ticker = yf.Ticker(ticker)
+    ticker_registry = get_ticker_registry()
+    stock_ticker = ticker_registry.get_ticker(ticker)
     return run_hedging_optimization(ticker, hist_data, stock_ticker, data_dir, log_dir, risk_free_rate)
 
 def run(data_map: Dict[str, pd.DataFrame], ticker_objects: Dict[str, object], limit: int, data_dir: str, log_dir: str, parallel: bool = True, max_workers: int = None):
