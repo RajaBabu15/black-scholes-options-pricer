@@ -18,6 +18,10 @@ env/
 ENV/
 .env
 
+# Data cache (unified loader)
+.optlib_cache/
+*_cache/
+
 # CSharp / VS / .NET
 bin/
 obj/
