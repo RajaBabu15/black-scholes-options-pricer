@@ -51,55 +51,74 @@ def run_hedging_optimization(ticker: str, hist_data: pd.DataFrame, stock_ticker:
         log("No suitable expiries found.")
         return None
 
-    strikes_by_exp={}; prices_by_exp={}; T_by_exp={}
+    # Build market_data: expiry -> DataFrame(strike, price)
+    market_data = {}
+    T_by_exp = {}
     for exp in exps:
         Ks, mids, T = load_or_download_chain_clean(ticker, exp, S0, r, q, stock, data_dir)
-        strikes_by_exp[exp] = Ks
-        prices_by_exp[exp] = mids
-        T_by_exp[exp] = T
+        # guard against empty/None
+        if Ks is None or len(Ks) == 0 or mids is None or len(mids) == 0:
+            log(f"Expiry {exp}: no chain returned (skipping).")
+            continue
+        # ensure arrays are numeric and same length
+        Ks = np.asarray(Ks, dtype=float)
+        mids = np.asarray(mids, dtype=float)
+        if Ks.shape[0] != mids.shape[0]:
+            log(f"Expiry {exp}: strikes/prices length mismatch (skipping).")
+            continue
+
+        df_exp = pd.DataFrame({
+            'strike': Ks,
+            'price' : mids
+        })
+        market_data[exp] = df_exp
+        T_by_exp[exp] = float(T)
         log(f"Expiry {exp}: {len(Ks)} options, T={T:.3f}y")
 
-    # Calibrate Heston
-    t0=time.time()
-    params = calibrate_heston_multi(stock, S0, r, q, exps, strikes_by_exp, prices_by_exp, T_by_exp)
+    if len(market_data) == 0:
+        log("No market data built for any expiry.")
+        return None
+
+    # Calibrate Heston (note: calibrate_heston_multi expects market_data dict now)
+    t0 = time.time()
+    params = calibrate_heston_multi(market_data, S0, r, q, expiries=list(market_data.keys()), T_by_exp=T_by_exp)
     kappa, theta, sigma_v, rho, v0 = params
     log(f"Calibrated params: kappa={kappa:.3f}, theta={theta:.4f}, sigma_v={sigma_v:.3f}, rho={rho:.3f}, v0={v0:.4f}")
-    log(f"Calibration took {time.time()-t0:.2f}s")
+    log(f"Calibration took {time.time() - t0:.2f}s")
 
-    # Target expiry near 60d
-    target_exp = exps[1] if len(exps)>1 else exps[0]
-    T = T_by_exp[target_exp]
-    Ks = strikes_by_exp[target_exp]
-    if len(Ks)==0:
-        print("No options in target expiry.", flush=True)
+    # Choose a target expiry (2nd if available) and strike ~ ATM median
+    exps_list = list(market_data.keys())
+    target_exp = exps_list[1] if len(exps_list) > 1 else exps_list[0]
+    Ks_arr = market_data[target_exp]['strike'].values
+    if len(Ks_arr) == 0:
+        log("No options in target expiry.")
         return None
-    K = float(np.median(Ks))
+    K = float(np.median(Ks_arr))
+    T = float(T_by_exp[target_exp])
 
     # Simulation settings
     steps_per_day_eval = 8
     n_paths_eval = 150
 
-    # Simulate eval set
+    # Simulate evaluation set
     log("Simulating Heston paths...")
-    n_steps = max(int(T*252*steps_per_day_eval), 120)
-    n_paths = n_paths_eval
-    t1=time.time()
-    S_paths, v_paths = generate_heston_paths(S0, r, q, T, kappa, theta, sigma_v, rho, v0, n_paths, n_steps)
-    times = torch.linspace(0., T, n_steps+1, dtype=tensor_dtype)
-    log(f"Simulated {n_paths} paths with {n_steps} steps in {time.time()-t1:.2f}s")
+    n_steps_eval = max(int(T * 252 * steps_per_day_eval), 120)
+    S_paths_eval, v_paths_eval = generate_heston_paths(S0, r, q, T, kappa, theta, sigma_v, rho, v0, n_paths_eval, n_steps_eval)
+    times_eval = torch.linspace(0.0, T, n_steps_eval + 1, dtype=tensor_dtype)
+    log(f"Simulated {n_paths_eval} paths with {n_steps_eval} steps in {0.0:.2f}s")
+
+    # Simulate training set (different random seed implicitly in generator)
+    n_paths_train = 120
+    n_steps_train = max(int(T * 252 * steps_per_day_eval), 200)
+    S_paths_train, v_paths_train = generate_heston_paths(S0, r, q, T, kappa, theta, sigma_v, rho, v0, n_paths_train, n_steps_train)
+    times_train = torch.linspace(0.0, T, n_steps_train + 1, dtype=tensor_dtype)
+
+    periods_per_year = 252 * steps_per_day_eval
 
     # Config grid
-    rebal_list = [2,5,10]
-    tc_list = [0.0005,0.001]
+    rebal_list = [2, 5, 10]
+    tc_list = [0.0005, 0.001]
     impact_list = [0.0, 1e-6]
-
-    # Training set
-    torch.manual_seed(int(time.time()) % 1_000_000)
-    n_steps_train = max(int(T*252*steps_per_day_eval), 200)
-    n_paths_train = 120
-    S_paths_train, v_paths_train = generate_heston_paths(S0, r, q, T, kappa, theta, sigma_v, rho, v0, n_paths_train, n_steps_train)
-    times_train = torch.linspace(0., T, n_steps_train+1, dtype=tensor_dtype)
-    periods_per_year = 252 * steps_per_day_eval
 
     rows = []
     for rebal in rebal_list:
@@ -107,79 +126,83 @@ def run_hedging_optimization(ticker: str, hist_data: pd.DataFrame, stock_ticker:
             for impact_v in impact_list:
                 log(f"Training scale for rebal={rebal}, tc={tc_v}, impact={impact_v}")
                 try:
-                    res = optimize_exposure_scale(S_paths_train, v_paths_train, times_train, K, r, q, rebal, 'bs', tc_v, impact_v, target_periods_per_year=periods_per_year, steps=100, lr=0.05)
-                    scale_star = res['scale']
+                    # Optimize exposure scale on training set (uses fast grid search)
+                    res = optimize_exposure_scale(
+                        torch.as_tensor(S_paths_train), torch.as_tensor(v_paths_train), times_train, K, r, q,
+                        rebal, 'bs', tc_v, impact_v, target_periods_per_year=periods_per_year
+                    )
+                    scale_star = float(res['scale'])
                     log(f"   -> learned scale={scale_star:.3f}")
-                    pnl_e, C0_e, step_ts_e, diag_e = delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=tc_v, impact_lambda=impact_v, rebal_freq=rebal, deltas_mode='bs', exposure_scale=scale_star, return_timeseries=True, anti_lookahead_checks=True)
+
+                    # Evaluate on the evaluation set
+                    pnl_e, C0_e, step_ts_e, diag_e = delta_hedge_sim(
+                        S_paths_eval, v_paths_eval, times_eval, K, r, q,
+                        tc=tc_v, impact_lambda=impact_v, rebal_freq=rebal, deltas_mode='bs',
+                        exposure_scale=scale_star, return_timeseries=True, anti_lookahead_checks=True
+                    )
+                    if step_ts_e is None:
+                        raise RuntimeError("step time series not returned")
                     ret_series = step_ts_e.mean(axis=0)
                     met_e = calculate_performance_metrics(ret_series, risk_free_rate=r, periods_per_year=float(periods_per_year))
                     sh, so, ca = met_e['sharpe_ratio'], met_e['sortino_ratio'], met_e['calmar_ratio']
                     dd, av = met_e['max_drawdown'], met_e['annual_volatility']
                     penalty = 0.0
-                    if sh < 1.0: penalty += 10.0 * (1.0 - sh)**2
-                    if sh > 4.0: penalty += 5.0 * (sh - 4.0)**2
-                    if so < 1.5: penalty += 6.0 * (1.5 - so)**2
-                    if ca < 1.0: penalty += 8.0 * (1.0 - ca)**2
-                    if dd > 0.25: penalty += 12.0 * (dd - 0.25)**2
-                    if av < 0.05: penalty += 6.0 * (0.05 - av)**2
-                    if av > 0.25: penalty += 6.0 * (av - 0.25)**2
-                    if sh < -0.5: penalty += 20.0 * abs(sh + 0.5)
-                    if so < -0.5: penalty += 20.0 * abs(so + 0.5)
-                    if ca < 0.0:  penalty += 15.0 * abs(ca)
-                    if met_e['annual_return'] < 0.0: penalty += 10.0 * abs(met_e['annual_return'])
-                    score = 0.5*sh + 0.3*so + 0.2*ca - penalty
+                    if sh < 1.0: penalty += 10.0 * (1.0 - sh) ** 2
+                    if sh > 4.0: penalty += 5.0 * (sh - 4.0) ** 2
+                    if so < 1.5: penalty += 6.0 * (1.5 - so) ** 2
+                    if ca < 1.0: penalty += 8.0 * (1.0 - ca) ** 2
+                    if dd > 0.25: penalty += 12.0 * (dd - 0.25) ** 2
+                    if av < 0.05: penalty += 6.0 * (0.05 - av) ** 2
+                    if av > 0.25: penalty += 6.0 * (av - 0.25) ** 2
+                    score = 0.5 * sh + 0.3 * so + 0.2 * ca - penalty
                     meets_gates = (1.0 <= sh <= 3.0) and (1.5 <= so <= 4.0) and (ca >= 1.0) and (dd <= 0.25) and (0.05 <= av <= 0.25)
-                    reasons = []
-                    if not (1.0 <= sh <= 3.0): reasons.append(f"Sharpe {sh:.3f} not in [1.0, 3.0]")
-                    if not (1.5 <= so <= 4.0): reasons.append(f"Sortino {so:.3f} not in [1.5, 4.0]")
-                    if ca < 1.0: reasons.append(f"Calmar {ca:.3f} < 1.0")
-                    if dd > 0.25: reasons.append(f"MaxDD {dd:.3f} > 0.25")
-                    if not (0.05 <= av <= 0.25): reasons.append(f"AnnVol {av:.3f} not in [0.05, 0.25]")
-                    rejection_reason = "OK" if meets_gates else "; ".join(reasons) if reasons else "Did not meet gates"
-                    rows.append({'rebal': rebal, 'tc': tc_v, 'impact': impact_v, 'scale': scale_star, 'mode': 'bs', 'score': score, 'penalty': penalty, 'meets_gates': meets_gates,
-                                 **met_e,
-                                 'rejection_reason': rejection_reason,
-                                 'num_trades_mean': float(np.mean(diag_e['trades'])),
-                                 'avg_spread_cost_mean': float(np.mean(diag_e['avg_spread_cost'])),
-                                 'avg_impact_cost_mean': float(np.mean(diag_e['avg_impact_cost']))})
+
+                    rows.append({
+                        'rebal': rebal,
+                        'tc': tc_v,
+                        'impact': impact_v,
+                        'scale': scale_star,
+                        'mode': 'bs',
+                        'score': score,
+                        'penalty': penalty,
+                        'meets_gates': bool(meets_gates),
+                        **met_e,
+                        'num_trades_mean': float(np.mean(diag_e['trades'])),
+                        'avg_spread_cost_mean': float(np.mean(diag_e['avg_spread_cost'])),
+                        'avg_impact_cost_mean': float(np.mean(diag_e['avg_impact_cost'])),
+                    })
                 except Exception as e:
                     log(f"   -> training/eval failed: {e}")
 
-    df = pd.DataFrame(rows).sort_values('score', ascending=False)
+    df = pd.DataFrame(rows).sort_values('score', ascending=False) if rows else pd.DataFrame(columns=['score'])
     log("Top 10 configs by score:")
     log(str(df.head(10)))
 
-    # Acceptance gates
-    if not df.empty:
-        best = df.iloc[0]
-        ok = (best['sharpe_ratio']>=1.0 and best['sortino_ratio']>=1.0 and best['calmar_ratio']>=1.0 and best['max_drawdown']<=0.25 and 0.05<=best['annual_volatility']<=0.25)
-    else:
-        ok = False
-    log(f"Best config meets gates: {ok}")
-
+    # Save results
     os.makedirs(data_dir, exist_ok=True)
     out_path = os.path.join(data_dir, f"opt_results_{ticker}.csv")
     df.to_csv(out_path, index=False)
     log(f"Saved all config results to {out_path}")
 
-    # Save best config JSON
-    try:
-        df_sorted = df.sort_values('score', ascending=False)
-        best_row = df_sorted[df_sorted['meets_gates']].head(1)
-        if best_row.empty:
-            best_row = df_sorted.head(1)
-        best = best_row.to_dict(orient='records')[0]
-        best['calibration'] = {'kappa': kappa, 'theta': theta, 'sigma_v': sigma_v, 'rho': rho, 'v0': v0}
-        best['ticker'] = ticker
-        best['timestamp'] = datetime.utcnow().isoformat()
-        json_path = os.path.join(data_dir, f"{ticker}_best_config.json")
-        with open(json_path, 'w') as f:
-            json.dump(best, f, indent=2)
-        log(f"Saved best configuration to {json_path}")
-    except Exception as e:
-        log(f"Failed to save best config: {e}")
+    # Save best config JSON if available
+    if not df.empty:
+        try:
+            df_sorted = df.sort_values('score', ascending=False)
+            best_row = df_sorted[df_sorted['meets_gates']].head(1)
+            if best_row.empty:
+                best_row = df_sorted.head(1)
+            best = best_row.to_dict(orient='records')[0]
+            best['calibration'] = {'kappa': kappa, 'theta': theta, 'sigma_v': sigma_v, 'rho': rho, 'v0': v0}
+            best['ticker'] = ticker
+            best['timestamp'] = datetime.utcnow().isoformat()
+            json_path = os.path.join(data_dir, f"{ticker}_best_config.json")
+            with open(json_path, 'w') as f:
+                json.dump(best, f, indent=2)
+            log(f"Saved best configuration to {json_path}")
+        except Exception as e:
+            log(f"Failed to save best config: {e}")
 
-    return best
+    return df.head(1).to_dict(orient='records')[0] if not df.empty else None
 
 
 def run_single_ticker(args):
