@@ -64,8 +64,13 @@ def delta_hedge_sim(S_paths, v_paths, times, K, r, q, tc=0.0008, impact_lambda=0
     S0 = S_paths[0, 0]
     if deltas_mode == 'bs':
         sigma0 = torch.sqrt(torch.maximum(v_paths[:, 0], torch.tensor(0.0, device=device))).mean()
-    else:
+    elif deltas_mode == 'heston':
+        if heston_params is None:
+            raise ValueError("heston_params required for heston mode")
+        _, _, _, _, v0 = heston_params
         sigma0 = math.sqrt(v0)  # For initial price
+    else:
+        raise ValueError("Unknown deltas_mode")
     C0 = bs_price(S0, K_t, r_t, q_t, sigma0, T, option_type=option_type)
     pnl = torch.zeros(n_paths, device=device)
     step_returns = torch.zeros((n_paths, n_steps), dtype=tensor_dtype, device=device) if return_timeseries else None
