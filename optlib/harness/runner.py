@@ -222,14 +222,14 @@ def run(data_map: Dict[str, pd.DataFrame], ticker_objects: Dict[str, object], li
         results = []
        
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_to_ticker = {executor.submit(run_single_ticker, args, timeout=300): args[0]  # Timeout 5min
+            future_to_ticker = {executor.submit(run_single_ticker, args): args[0]  # Submit without timeout
                                for args in args_list}
            
             for i, future in enumerate(as_completed(future_to_ticker), 1):
                 ticker = future_to_ticker[future]
                 print(f"[{i}/{len(tickers)}] Completed: {ticker}")
                 try:
-                    result = future.result()
+                    result = future.result(timeout=300)  # Apply timeout here
                     if result is not None:
                         results.append(result)
                 except TimeoutError:
