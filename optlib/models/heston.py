@@ -1,122 +1,55 @@
 import math
-from typing import List, Dict, Optional
-import numpy as np
-import pandas as pd
-import logging  
-from optlib.pricing.iv import implied_vol_from_price
-from optlib.models.heston import heston_char_func
-from optlib.pricing.cos import cos_price_from_cf
-from scipy.optimize import least_squares
+import torch
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def heston_char_func(u, S0, r, q, T, kappa, theta, sigma_v, rho, v0):
+    cpu = torch.device('cpu')
+    cdtype = torch.complex128
+    u = torch.as_tensor(u, dtype=cdtype, device=cpu)
+    i = torch.tensor(1j, dtype=cdtype, device=cpu)
+    sigma_v = max(float(sigma_v), 1e-8)
+    T = max(float(T), 1e-8)
+    a = kappa * theta
+    alpha = kappa - rho * sigma_v * i * u
+    beta = (sigma_v**2) * (i * u + u**2)
+    discriminant = alpha**2 + beta
+    d = torch.sqrt(discriminant + 1e-16j)
+    if torch.any(torch.isnan(d)):
+        return torch.ones_like(u)
+    g = (alpha - d) / (alpha + d)
+    g = torch.clamp(g.real, min=-0.9999, max=0.9999) + 1j * torch.clamp(g.imag, min=-50, max=50)
+    exp_dT = torch.exp(-d * T)
+    log_arg = (1 - g * exp_dT) / (1 - g)
+    log_arg = torch.clamp(log_arg.real, min=1e-12, max=1e12) + 1j * torch.clamp(log_arg.imag, min=-1e6, max=1e6)
+    C = (i * u * (math.log(float(S0)) + (r - q) * T)
+         + a / (sigma_v**2) * ((alpha - d) * T - 2.0 * torch.log(log_arg)))
+    D = (alpha - d) / (sigma_v**2) * (1.0 - exp_dT) / (1.0 - g * exp_dT)
+    exponent = C + D * v0
+    real_clamped = torch.clamp(exponent.real, min=-200.0, max=200.0)
+    imag_clamped = torch.clamp(exponent.imag, min=-1e6, max=1e6)
+    exponent_clamped = torch.complex(real_clamped, imag_clamped)
+    result = torch.exp(exponent_clamped)
+    return result
 
-def calibrate_heston_multi(
-    market_data: Dict[str, pd.DataFrame],
-    S0: float,
-    r: float,
-    q: float,
-    expiries: Optional[List[str]] = None,
-    T_by_exp: Optional[Dict[str, float]] = None,
-    strike_col: str = "strike",
-    price_col: str = "price",
-    T_col: str = "T",
-    max_strikes_per_expiry: int = 15,
-) -> List[float]:
-    """
-    Calibrate Heston parameters to market option data.
-    market_data: dict mapping expiry keys -> pandas.DataFrame.
-                 Each DataFrame must contain columns for strikes and prices (defaults: 'strike','price').
-                 Optionally it can be provided via T_by_exp[expiry].
-    S0, r, q: spot, domestic rate, dividend yield (used in pricing / implied vol).
-    expiries: optional list of expiry keys to use; default = market_data.keys() order.
-    Returns: list of calibrated params [kappa, theta, sigma_v, rho, v0] or default if fit fails.
-    """
-    if expiries is None:
-        expiries = list(market_data.keys())
-    if T_by_exp is None:
-        T_by_exp = {}
-    samples = []
-    for exp in expiries:
-        df = market_data.get(exp, None)
-        if df is None or df.shape[0] == 0:
-            continue
+def bates_char_func(u, S0, r, q, T, kappa, theta, sigma_v, rho, v0, lambda_j, mu_j, sigma_j):
+    cpu = torch.device('cpu')
+    cdtype = torch.complex128
+    heston_phi = heston_char_func(u, S0, r, q, T, kappa, theta, sigma_v, rho, v0)
+    lambda_j_c = torch.as_tensor(lambda_j, dtype=cdtype, device=cpu)
+    mu_j_c = torch.as_tensor(mu_j, dtype=cdtype, device=cpu)
+    sigma_j_c = torch.as_tensor(sigma_j, dtype=cdtype, device=cpu)
+    T_c = torch.as_tensor(T, dtype=cdtype, device=cpu)
+    u_c = torch.as_tensor(u, dtype=cdtype, device=cpu)
+    i_c = torch.tensor(1j, dtype=cdtype, device=cpu)
+    one_c = torch.tensor(1.0, dtype=cdtype, device=cpu)
+    half_c = torch.tensor(0.5, dtype=cdtype, device=cpu)
 
-        if strike_col not in df.columns or price_col not in df.columns:
+    m = torch.exp(mu_j_c + half_c * sigma_j_c**2)  
+    drift_correction = lambda_j_c * (m - one_c)  
+    r_eff = r - float(drift_correction.real)  
 
-            continue
+    heston_phi_eff = heston_char_func(u_c, S0, r_eff, q, T, kappa, theta, sigma_v, rho, v0)
 
-        if T_col in df.columns:
-            Ts = df[T_col].astype(float).to_numpy()
-        else:
-            T_scalar = T_by_exp.get(exp, None)
-            if T_scalar is None:
-                continue
-            Ts = np.full(len(df), float(T_scalar))
-        Ks = df[strike_col].to_numpy(dtype=float)
-        Ps = df[price_col].to_numpy(dtype=float)
-        if len(Ks) == 0:
-            continue
-
-        idx = np.linspace(0, len(Ks) - 1, num=min(max_strikes_per_expiry, len(Ks)), dtype=int)
-        for j in idx:
-            K = float(Ks[j])
-            P = float(Ps[j])
-            T = float(Ts[j])
-            if T <= 1e-12:
-                continue
-            try:
-                iv_mkt = implied_vol_from_price(P, S0, K, r, q, T)
-            except Exception:
-                continue
-            if not np.isfinite(iv_mkt):
-                continue
-
-            d1 = (math.log(S0 / K) + (r - q + 0.5 * iv_mkt * iv_mkt) * T) / (iv_mkt * math.sqrt(T))
-            vega_mkt = S0 * math.exp(-q * T) * math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi) * math.sqrt(T)
-            vega_mkt = max(vega_mkt, 1e-6)
-            samples.append((T, K, P, iv_mkt, vega_mkt))
-    if len(samples) == 0:
-
-        return [3.0, 0.04, 0.4, -0.6, 0.04]
-    params0 = np.array([3.0, 0.2 ** 2, 0.4, -0.6, 0.2 ** 2], dtype=float)
-    lb = np.array([0.1, 0.0001, 0.05, -0.99, 0.0001], dtype=float)
-    ub = np.array([10.0, 1.0, 1.5, 0.0, 1.0], dtype=float)
-    def objective(p):
-        p = np.asarray(p, dtype=float)
-        kappa, theta, sigma_v, rho, v0 = p
-
-        feller_viol = max(0, (sigma_v**2 - 2 * kappa * theta) / (2 * kappa * theta))
-        penalty = 100 * feller_viol
-        if np.any(p < lb) or np.any(p > ub) or (theta > 1.0):
-            return np.full(len(samples), 1e3 + penalty, dtype=float)
-
-        if feller_viol > 0:
-            logger.warning(f"Feller violation: {feller_viol:.4f} at params {p}")
-        logger.info(f"Evaluating params: {p}")
-        errs = []
-        for T, K, P, iv_mkt, vega_mkt in samples:
-            try:
-                cf = lambda u: heston_char_func(u, S0, r, q, T, kappa, theta, sigma_v, rho, v0)
-
-                modelP = cos_price_from_cf(S0, float(K), r, q, T, cf, params=p)
-                if not np.isfinite(modelP):
-                    errs.append(10.0)
-                    continue
-                err = (float(modelP) - P) / vega_mkt
-                errs.append(err)
-            except Exception as e:
-                logger.error(f"Error in pricing: {e}")
-                errs.append(10.0)
-        errs = np.asarray(errs, dtype=float)
-
-        errs += penalty / len(samples)  
-        logger.info(f"Max residual: {np.max(np.abs(errs)):.4f}, num samples: {len(samples)}")
-        return errs
-    res = least_squares(objective, x0=params0, bounds=(lb, ub),
-                        method='trf', max_nfev=1000, loss='soft_l1', f_scale=0.05, ftol=1e-8)
-    if not res.success:
-        logger.warning("Optimization failed, returning initial params")
-        return params0.tolist()
-    logger.info(f"Calibrated params: {res.x.tolist()}")
-    return res.x.tolist()
+    psi_u = torch.exp(i_c * u_c * mu_j_c - half_c * u_c**2 * sigma_j_c**2)
+    jump_component = lambda_j_c * T_c * (psi_u - one_c)
+    jump_phi = torch.exp(jump_component)
+    return heston_phi_eff * jump_phi
