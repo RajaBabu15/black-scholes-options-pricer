@@ -3,6 +3,7 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from optlib.utils.cache import get_ticker_registry, get_session_cache
 
 
 def choose_expiries(stock: yf.Ticker, min_td=10, max_td=100, targets=(30, 60, 90)) -> List[str]:
@@ -65,6 +66,16 @@ def fetch_clean_chain(stock: yf.Ticker, expiry: str, S0: float, r: float, q: flo
 def load_or_download_chain_clean(ticker: str, expiry: str, S0: float, r: float, q: float, stock: yf.Ticker, data_dir: str) -> Tuple[np.ndarray, np.ndarray, float]:
     import os
     fname = os.path.join(data_dir, f"{ticker}_chain_{expiry}.csv")
+    
+    # Check session-level cache first to avoid re-downloading during same session
+    cache = get_session_cache()
+    cache_key = f"options_chain_{ticker}_{expiry}"
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        strikes, mids, T = cached_data
+        print(f"Using cached options chain for {ticker} {expiry}")
+        return strikes, mids, T
+    
     if os.path.exists(fname):
         df = pd.read_csv(fname)
         # Recompute T from current date to ensure no negative expiry
@@ -75,7 +86,11 @@ def load_or_download_chain_clean(ticker: str, expiry: str, S0: float, r: float, 
         T = int(T_days * 5 / 7) / 252
         strikes = df['strike'].values.astype(float)
         mids = df['mid'].values.astype(float)
+        
+        # Cache in session for 30 minutes to avoid re-processing
+        cache.set(cache_key, (strikes, mids, T), ttl=1800)
         return strikes, mids, T
+    
     # otherwise fetch and clean now
     Ks, mids, T = fetch_clean_chain(stock, expiry, S0, r, q)
     if len(Ks) > 0:
@@ -83,5 +98,9 @@ def load_or_download_chain_clean(ticker: str, expiry: str, S0: float, r: float, 
         out['expiry'] = expiry
         out['T_days'] = int(max((pd.Timestamp(expiry) - pd.Timestamp.utcnow().tz_localize(None)).days, 1))
         out.to_csv(fname, index=False)
+        
+        # Cache in session for 30 minutes
+        cache.set(cache_key, (Ks, mids, T), ttl=1800)
+    
     return Ks, mids, T
 
