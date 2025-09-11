@@ -1,152 +1,197 @@
 # optlib/data/history.py
 """
-Historical stock price data fetching and caching module
+Historical stock price data analysis module - REFACTORED to use centralized data_store
+
+This module now focuses on data analysis and processing functions that accept
+data as parameters, rather than fetching data directly. All data I/O is handled
+by the centralized data_store module.
 """
 import pandas as pd
 import numpy as np
-import json
-import os
-from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+from .data_store import default_data_store
 
 
-def get_stock_price_history(symbol: str, start_date: str, end_date: str, cache_dir: str = "cache") -> pd.DataFrame:
+def analyze_price_history(price_data: pd.DataFrame) -> Dict[str, Any]:
     """
-    Fetch historical stock price data for a given symbol and date range.
-    
-    In a real implementation, this would fetch from Yahoo Finance, Alpha Vantage, or similar.
-    For this example, we'll simulate the data fetching with caching.
+    Analyze historical price data that has been provided as input.
     
     Args:
-        symbol: Stock symbol (e.g., 'AAPL', 'GOOGL')
-        start_date: Start date in 'YYYY-MM-DD' format
-        end_date: End date in 'YYYY-MM-DD' format
-        cache_dir: Directory to store cached data
+        price_data: DataFrame with columns: Date, Open, High, Low, Close, Volume
         
     Returns:
-        DataFrame with columns: Date, Open, High, Low, Close, Volume
+        Dictionary with analysis results
     """
-    # Create cache directory if it doesn't exist
-    os.makedirs(cache_dir, exist_ok=True)
+    if price_data.empty or 'Close' not in price_data.columns:
+        return {}
     
-    cache_file = os.path.join(cache_dir, f"{symbol}_{start_date}_{end_date}_history.json")
+    # Ensure Date column is datetime
+    if 'Date' in price_data.columns:
+        price_data = price_data.copy()
+        price_data['Date'] = pd.to_datetime(price_data['Date'])
+        price_data = price_data.sort_values('Date')
     
-    # Check if cached data exists
-    if os.path.exists(cache_file):
-        with open(cache_file, 'r') as f:
-            data = json.load(f)
-        return pd.DataFrame(data)
+    close_prices = price_data['Close']
     
-    # Simulate API call to fetch data (in real implementation would use requests/yfinance)
-    print(f"Fetching historical data for {symbol} from {start_date} to {end_date}...")
+    # Calculate returns
+    returns = close_prices.pct_change().dropna()
     
-    # Generate mock historical data
-    start = datetime.strptime(start_date, '%Y-%m-%d')
-    end = datetime.strptime(end_date, '%Y-%m-%d')
-    dates = pd.date_range(start=start, end=end, freq='D')
+    analysis = {
+        'total_periods': len(price_data),
+        'price_start': float(close_prices.iloc[0]),
+        'price_end': float(close_prices.iloc[-1]),
+        'price_min': float(close_prices.min()),
+        'price_max': float(close_prices.max()),
+        'total_return': float((close_prices.iloc[-1] / close_prices.iloc[0]) - 1),
+        'average_return': float(returns.mean()),
+        'volatility': float(returns.std()),
+        'annualized_volatility': float(returns.std() * np.sqrt(252)),
+        'sharpe_ratio': float(returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0,
+        'max_drawdown': calculate_max_drawdown(close_prices),
+        'average_volume': float(price_data['Volume'].mean()) if 'Volume' in price_data.columns else None
+    }
     
-    # Filter out weekends (simple approach)
-    business_dates = [d for d in dates if d.weekday() < 5]
-    
-    # Generate realistic price data
-    base_price = 100.0
-    np.random.seed(42)  # For reproducible data
-    
-    data = []
-    current_price = base_price
-    
-    for date in business_dates:
-        # Random walk with some volatility
-        daily_return = np.random.normal(0.0005, 0.02)  # Small positive drift, 2% daily vol
-        current_price *= (1 + daily_return)
-        
-        # Generate OHLC data
-        high = current_price * (1 + abs(np.random.normal(0, 0.01)))
-        low = current_price * (1 - abs(np.random.normal(0, 0.01)))
-        open_price = current_price * (1 + np.random.normal(0, 0.005))
-        volume = int(np.random.normal(1000000, 200000))
-        
-        data.append({
-            'Date': date.strftime('%Y-%m-%d'),
-            'Open': round(open_price, 2),
-            'High': round(high, 2),
-            'Low': round(low, 2),
-            'Close': round(current_price, 2),
-            'Volume': max(volume, 100000)
-        })
-    
-    # Cache the data
-    with open(cache_file, 'w') as f:
-        json.dump(data, f, indent=2)
-    
-    return pd.DataFrame(data)
+    return analysis
 
 
-def get_current_stock_price(symbol: str, cache_dir: str = "cache") -> float:
+def calculate_max_drawdown(prices: pd.Series) -> float:
     """
-    Get current stock price for a symbol.
+    Calculate maximum drawdown from price series.
     
     Args:
-        symbol: Stock symbol
-        cache_dir: Directory to check for cached data
+        prices: Series of price values
         
     Returns:
-        Current stock price
+        Maximum drawdown as decimal
     """
-    # In real implementation, would fetch real-time price
-    # For now, try to get latest from cached historical data
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    try:
-        cache_files = [f for f in os.listdir(cache_dir) if f.startswith(symbol) and f.endswith('_history.json')]
-    except FileNotFoundError:
-        cache_files = []
-    
-    if cache_files:
-        # Get the most recent cache file
-        latest_file = sorted(cache_files)[-1]
-        cache_path = os.path.join(cache_dir, latest_file)
-        
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-        
-        if data:
-            return data[-1]['Close']
-    
-    # Fallback: return simulated current price
-    print(f"Fetching current price for {symbol}...")
-    np.random.seed(hash(symbol) % 2**32)  # Deterministic but symbol-dependent
-    return round(100.0 * (1 + np.random.normal(0, 0.1)), 2)
+    peak = prices.cummax()
+    drawdown = (prices - peak) / peak
+    return float(drawdown.min())
 
 
-def calculate_historical_volatility(symbol: str, period_days: int = 252, cache_dir: str = "cache") -> float:
+def calculate_returns_statistics(price_data: pd.DataFrame, period: str = 'daily') -> Dict[str, float]:
     """
-    Calculate historical volatility from stock price data.
+    Calculate detailed return statistics from price data.
     
     Args:
-        symbol: Stock symbol
-        period_days: Number of days to look back for volatility calculation
-        cache_dir: Cache directory
+        price_data: DataFrame with price data
+        period: 'daily', 'weekly', or 'monthly'
         
     Returns:
-        Annualized historical volatility
+        Dictionary with return statistics
     """
-    end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=period_days + 30)).strftime('%Y-%m-%d')
+    if price_data.empty or 'Close' not in price_data.columns:
+        return {}
     
-    df = get_stock_price_history(symbol, start_date, end_date, cache_dir)
+    price_data = price_data.copy()
+    price_data['Date'] = pd.to_datetime(price_data['Date'])
+    price_data = price_data.sort_values('Date').set_index('Date')
     
-    if len(df) < 2:
-        # Fallback volatility
-        return 0.20
+    # Resample based on period
+    if period == 'weekly':
+        resampled = price_data.resample('W')['Close'].last()
+    elif period == 'monthly':
+        resampled = price_data.resample('M')['Close'].last()
+    else:  # daily
+        resampled = price_data['Close']
     
-    # Calculate daily returns
-    df['Date'] = pd.to_datetime(df['Date'])
-    df = df.sort_values('Date')
-    df['Returns'] = df['Close'].pct_change().dropna()
+    returns = resampled.pct_change().dropna()
     
-    # Calculate annualized volatility
-    daily_volatility = df['Returns'].std()
-    annualized_volatility = daily_volatility * np.sqrt(252)  # Assuming 252 trading days per year
+    return {
+        'mean_return': float(returns.mean()),
+        'std_return': float(returns.std()),
+        'skewness': float(returns.skew()),
+        'kurtosis': float(returns.kurtosis()),
+        'min_return': float(returns.min()),
+        'max_return': float(returns.max()),
+        'positive_days': int((returns > 0).sum()),
+        'negative_days': int((returns < 0).sum()),
+        'total_days': len(returns)
+    }
+
+
+def calculate_moving_averages(price_data: pd.DataFrame, windows: list = [20, 50, 200]) -> pd.DataFrame:
+    """
+    Calculate moving averages for given windows.
     
-    return float(annualized_volatility)
+    Args:
+        price_data: DataFrame with price data
+        windows: List of window sizes for moving averages
+        
+    Returns:
+        DataFrame with original data plus moving averages
+    """
+    if price_data.empty or 'Close' not in price_data.columns:
+        return price_data
+    
+    result = price_data.copy()
+    
+    for window in windows:
+        result[f'MA_{window}'] = result['Close'].rolling(window=window).mean()
+    
+    return result
+
+
+def detect_support_resistance_levels(price_data: pd.DataFrame, window: int = 20) -> Dict[str, list]:
+    """
+    Detect potential support and resistance levels from price data.
+    
+    Args:
+        price_data: DataFrame with OHLC data
+        window: Window size for level detection
+        
+    Returns:
+        Dictionary with support and resistance levels
+    """
+    if price_data.empty:
+        return {'support': [], 'resistance': []}
+    
+    highs = price_data['High'].rolling(window=window, center=True).max()
+    lows = price_data['Low'].rolling(window=window, center=True).min()
+    
+    # Find local maxima (resistance)
+    resistance_levels = []
+    for i in range(window, len(price_data) - window):
+        if price_data['High'].iloc[i] == highs.iloc[i]:
+            resistance_levels.append(float(price_data['High'].iloc[i]))
+    
+    # Find local minima (support)
+    support_levels = []
+    for i in range(window, len(price_data) - window):
+        if price_data['Low'].iloc[i] == lows.iloc[i]:
+            support_levels.append(float(price_data['Low'].iloc[i]))
+    
+    return {
+        'support': sorted(list(set(support_levels))),
+        'resistance': sorted(list(set(resistance_levels)), reverse=True)
+    }
+
+
+# === CONVENIENCE FUNCTIONS THAT USE DATA_STORE ===
+# These functions provide easy access to data_store functionality for backward compatibility
+
+def get_stock_price_history(symbol: str, start_date: str, end_date: str, **kwargs) -> pd.DataFrame:
+    """
+    Get historical stock price data using centralized data store.
+    
+    This function is maintained for backward compatibility but now uses data_store.
+    """
+    return default_data_store.get_stock_price_history(symbol, start_date, end_date, **kwargs)
+
+
+def get_current_stock_price(symbol: str, **kwargs) -> float:
+    """
+    Get current stock price using centralized data store.
+    
+    This function is maintained for backward compatibility but now uses data_store.
+    """
+    return default_data_store.get_current_stock_price(symbol, **kwargs)
+
+
+def calculate_historical_volatility(symbol: str, period_days: int = 252, **kwargs) -> float:
+    """
+    Calculate historical volatility using centralized data store.
+    
+    This function is maintained for backward compatibility but now uses data_store.
+    """
+    return default_data_store.calculate_historical_volatility(symbol, period_days, **kwargs)
